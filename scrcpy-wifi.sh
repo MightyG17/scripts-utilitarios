@@ -1,78 +1,86 @@
 #!/bin/bash
 
+clear
 echo "=================================================="
 echo "       Gerenciador Scrcpy Wi-Fi & Multi-Dispositivo"
 echo "=================================================="
 
-# 1. Se houver um celular no cabo USB, ativa o modo TCP/IP automaticamente
-if adb devices | grep -q "device$"; then
+# 1. Verifica se há algum aparelho conectado via USB para ativar o modo TCP/IP (porta 5555)
+USB_DEVICE=$(adb devices | grep -w "device" | grep -v "tcpip" | awk '{print $1}')
+
+if [ -n "$USB_DEVICE" ]; then
     echo "📱 Dispositivo via USB detectado! Ativando porta TCP/IP (5555)..."
-    adb tcpip 5555 >/dev/null 2>&1
+    adb -s "$USB_DEVICE" tcpip 5555
     sleep 2
 fi
 
-# 2. Lista pré-configurada dos seus aparelhos Motorola na rede
-# Você pode adicionar mais IPs/MACs aqui conforme necessário
-declare -A DEVICES
-DEVICES=(
-    ["192.168.29.9"]="Moto G54 Principal"
-    ["192.168.29.17"]="Segundo Aparelho Motorola"
-)
-
-# Descobre quais estão ativos na rede usando o comando ip neighbor / arp cache
+# 2. Varre a rede e lista todos os dispositivos ADB conectados (tanto via USB quanto Wi-Fi)
 echo "🔍 Verificando aparelhos Motorola ativos na rede..."
+echo ""
 
-ACTIVE_IPS=()
-for ip in "${!DEVICES[@]}"; do
-    # Dá um ping rápido silencioso para garantir que o IP responda
-    ping -c 1 -W 1 "$ip" >/dev/null 2>&1
-    if [ $? -eq 0 ]; then
-        ACTIVE_IPS+=("$ip")
-    fi
-done
+# Cria um array com os IPs encontrados
+mapfile -t DEVICES < <(adb devices | grep -E "device$" | awk '{print $1}')
 
-# Se nenhum ping responder, tenta listar os IPs conhecidos mesmo assim
-if [ ${#ACTIVE_IPS[@]} -eq 0 ]; then
-    ACTIVE_IPS=("192.168.29.9" "192.168.29.17")
+if [ ${#DEVICES[@]} -eq 0 ]; then
+    echo "❌ Nenhum dispositivo ADB encontrado! Conecte via USB ou verifique o Wi-Fi."
+    exit 1
 fi
 
-# 3. Exibe o menu interativo
-echo ""
 echo "Selecione o aparelho para espelhar:"
 echo "--------------------------------------------------"
+for i in "${!DEVICES[@]}"; do
+    DEV="${DEVICES[$i]}"
+    # Pega o modelo amigável do celular se possível
+    MODEL=$(adb -s "$DEV" shell getprop ro.product.model 2>/dev/null | tr -d '\r')
+    [ -z "$MODEL" ] && MODEL="Dispositivo $DEV"
+    
+    # Se for IP, exibe limpo; se for serial USB, avisa
+    if [[ "$DEV" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        IP_PURA="$DEV"
+    else
+        # Tenta pegar o IP local caso esteja conectado só por USB
+        IP_PURA=$(adb -s "$DEV" shell ip route 2>/dev/null | awk '{print $9}' | tail -n 1)
+        [ -z "$IP_PURA" ] && IP_PURA="$DEV"
+    fi
 
-i=1
-declare -A MENU_MAP
-for ip in "${ACTIVE_IPS[@]}"; do
-    name="${DEVICES[$ip]:-Dispositivo Motorola}"
-    MENU_MAP[$i]="$ip"
-    echo " [$i] $name (IP: $ip)"
-    ((i++))
+    echo " [$((i+1))] $MODEL (IP: $IP_PURA)"
 done
-
 echo "--------------------------------------------------"
-read -rp "Digite o número da opção [1-$((i-1))]: " CHOICE
 
-SELECTED_IP="${MENU_MAP[$CHOICE]}"
+# Lê a escolha do usuário com segurança
+read -p "Digite o número da opção [1-${#DEVICES[@]}]: " ESCOLHA
 
-if [ -z "$SELECTED_IP" ]; then
+# Valida se a entrada é um número válido
+if ! [[ "$ESCOLHA" =~ ^[0-9]+$ ]] || [ "$ESCOLHA" -lt 1 ] || [ "$ESCOLHA" -gt "${#DEVICES[@]}" ]; then
     echo "❌ Opção inválida!"
     exit 1
 fi
 
-echo ""
-echo "🌐 Conectando via ADB em $SELECTED_IP:5555..."
-adb connect "$SELECTED_IP:5555"
+# Define o alvo com base na escolha
+SELECIONADO="${DEVICES[$((ESCOLHA-1))]}"
 
-# Verifica se a conexão foi bem sucedida antes de abrir o scrcpy
-if ! adb devices | grep -q "$SELECTED_IP:5555.*device"; then
-    echo "❌ Falha ao conectar em $SELECTED_IP."
-    echo "Dica: Conecte o aparelho via USB e execute 'adb tcpip 5555' primeiro."
+# Extrai apenas o IP puro caso venha com a porta junto
+IP_SELECIONADO=$(echo "$SELECIONADO" | cut -d: -f1)
+
+# Se o item selecionado for um identificador USB e não um IP, tenta descobrir o IP atribuído a ele
+if ! [[ "$IP_SELECIONADO" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    IP_SELECIONADO=$(adb -s "$SELECIONADO" shell ip -4 addr show wlan0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+fi
+
+if [ -z "$IP_SELECIONADO" ]; then
+    # Fallback: pega o IP direto da conexão ADB se falhar no wlan0
+    IP_SELECIONADO=$(adb -s "$SELECIONADO" get-serialno | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}')
+fi
+
+if [ -z "$IP_SELECIONADO" ]; then
+    echo "❌ Não foi possível determinar o IP Wi-Fi do aparelho selecionado."
     exit 1
 fi
 
-echo "🔊 Reiniciando serviços de áudio (PipeWire)..."
-systemctl --user restart pipewire pipewire-pulse wireplumber >/dev/null 2>&1
+echo ""
+echo "🌐 Conectando via ADB em $IP_SELECIONADO:5555..."
+adb connect "$IP_SELECIONADO:5555"
+sleep 1
 
-echo "🚀 Iniciando o scrcpy para $SELECTED_IP..."
-scrcpy -s "$SELECTED_IP:5555"
+echo "🚀 Iniciando o scrcpy para $IP_SELECIONADO (Modo Estável sem Áudio)..."
+scrcpy -s "$IP_SELECIONADO:5555" --no-audio --max-size=1080 --video-bit-rate=12M --max-fps=60
